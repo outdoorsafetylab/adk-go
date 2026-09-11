@@ -30,14 +30,21 @@ import (
 	"google.golang.org/genai"
 )
 
-// truncatedStreamModel emits a partial ("streaming") event and then stops
-// without the terminal non-partial aggregate.
+// truncatedStreamModel completes a turn with a partial ("streaming") event as
+// its last one: it yields one partial, then its iterator returns normally with
+// no error and no terminal aggregate.
 //
-// That is the shape model/gemini's generateStream produces when the upstream
-// stream ends early: both the mid-stream error path and the consumer-stopped
-// path return before aggregator.Close(), so the chunks already yielded are the
-// whole turn. A stream that runs to completion instead ends on the aggregate,
-// and that event is handshaked — see TestPluginPathOnCompletedStream.
+// That is the condition the racing read needs. base_flow.Run reads
+// lastEvent.IsFinalResponse() only after the inner iterator finishes normally —
+// an error and a stopped consumer both return before it — so the last event
+// reaching that read is a partial exactly when a model ends a turn this way.
+//
+// model/gemini does not: its generateStream appends aggregator.Close() on clean
+// completion, and Close returns a response whenever any chunk was processed, so
+// a partial there is always followed by the non-partial aggregate. That shape is
+// TestPluginPathOnCompletedStream, and it does not race. What this test
+// describes is therefore the model.LLM contract, which permits ending a turn on
+// a partial, rather than any behaviour of the shipped Gemini backend.
 type truncatedStreamModel struct{ emitted atomic.Int64 }
 
 func (m *truncatedStreamModel) Name() string { return "truncated-stream" }
@@ -53,7 +60,7 @@ func (m *truncatedStreamModel) GenerateContent(_ context.Context, _ *model.LLMRe
 }
 
 // completedStreamModel emits a partial chunk and then the terminal aggregate,
-// which is what a stream that runs to completion looks like.
+// which is what model/gemini produces on clean completion.
 type completedStreamModel struct{ emitted atomic.Int64 }
 
 func (m *completedStreamModel) Name() string { return "completed-stream" }
