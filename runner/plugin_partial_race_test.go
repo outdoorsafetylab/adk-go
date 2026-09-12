@@ -30,6 +30,8 @@ import (
 	"google.golang.org/adk/v2/plugin"
 	"google.golang.org/adk/v2/plugin/loggingplugin"
 	"google.golang.org/adk/v2/session"
+	"google.golang.org/adk/v2/tool"
+	"google.golang.org/adk/v2/tool/functiontool"
 )
 
 // numTurns is how many turns each test drives.
@@ -228,5 +230,103 @@ func TestPluginPathOnCompletedStream(t *testing.T) {
 	if got := tally.nonPartial.Load(); got < numTurns {
 		t.Fatalf("non-partial events reaching OnEventCallback = %d across %d turns, want at least %d — the terminal aggregate is what makes this case handshaked, so without it this test proves nothing",
 			got, numTurns, numTurns)
+	}
+}
+
+// skipSummarizationModel yields a function call on the first turn and text
+// afterwards, counting how many times it was asked.
+type skipSummarizationModel struct {
+	calls atomic.Int64
+}
+
+func (m *skipSummarizationModel) Name() string { return "skip-summarization" }
+
+func (m *skipSummarizationModel) GenerateContent(_ context.Context, _ *model.LLMRequest, _ bool) iter.Seq2[*model.LLMResponse, error] {
+	first := m.calls.Add(1) == 1
+	return func(yield func(*model.LLMResponse, error) bool) {
+		if first {
+			yield(&model.LLMResponse{Content: &genai.Content{
+				Role:  genai.RoleModel,
+				Parts: []*genai.Part{{FunctionCall: &genai.FunctionCall{ID: "c1", Name: "noop"}}},
+			}}, nil)
+			return
+		}
+		yield(&model.LLMResponse{Content: genai.NewContentFromText("done", "model")}, nil)
+	}
+}
+
+// TestNonPartialStopConditionIsReadAfterTheCallbacks pins where the stop
+// condition for a NON-partial event is decided: after the consumer's plugin
+// callbacks, not before.
+//
+// The partial case has to be decided before the handoff, because a partial is
+// not handshaked and reading it afterwards races fromPlugin's write. It is
+// tempting to hoist the non-partial read the same way. This test is why that is
+// wrong: IsFinalResponse also reads Actions.SkipSummarization, fromPlugin
+// restores Compaction only, and so a plugin that sets SkipSummarization in place
+// keeps it. A non-partial event IS handshaked, so the late read sees that and
+// stops the loop; an early read would see the pre-callback false, run the tool
+// response through another model call, and silently undo SkipSummarization.
+//
+// The differential is the model call count: 1 when the read is late, 2 when it
+// is early.
+func TestNonPartialStopConditionIsReadAfterTheCallbacks(t *testing.T) {
+	noop, err := functiontool.New(functiontool.Config{
+		Name:        "noop",
+		Description: "returns a value",
+	}, func(_ agent.Context, _ struct{}) (string, error) {
+		return "ok", nil
+	})
+	if err != nil {
+		t.Fatalf("functiontool.New() error = %v", err)
+	}
+
+	var set atomic.Int64
+	skipper, err := plugin.New(plugin.Config{
+		Name: "skipper",
+		OnEventCallback: func(_ agent.InvocationContext, ev *session.Event) (*session.Event, error) {
+			// In place, returning nil — the idiom fromPlugin documents, and
+			// SkipSummarization is a field it does not restore.
+			if ev.LLMResponse.Content != nil {
+				for _, part := range ev.LLMResponse.Content.Parts {
+					if part != nil && part.FunctionResponse != nil {
+						ev.Actions.SkipSummarization = true
+						set.Add(1)
+					}
+				}
+			}
+			return nil, nil
+		},
+	})
+	if err != nil {
+		t.Fatalf("plugin.New() error = %v", err)
+	}
+
+	m := &skipSummarizationModel{}
+	root, err := llmagent.New(llmagent.Config{Name: "assistant", Model: m, Tools: []tool.Tool{noop}})
+	if err != nil {
+		t.Fatalf("llmagent.New() error = %v", err)
+	}
+	r, err := New(Config{
+		AppName:           "skip_summarization",
+		Agent:             root,
+		SessionService:    session.InMemoryService(),
+		AutoCreateSession: true,
+		PluginConfig:      PluginConfig{Plugins: []*plugin.Plugin{skipper}},
+	})
+	if err != nil {
+		t.Fatalf("New() error = %v", err)
+	}
+	for _, runErr := range r.Run(t.Context(), "u", "s", genai.NewContentFromText("call the tool", genai.RoleUser), agent.RunConfig{}) {
+		if runErr != nil {
+			t.Fatalf("Run() error = %v", runErr)
+		}
+	}
+
+	if set.Load() == 0 {
+		t.Fatal("the plugin never saw a function response event; this test is not exercising SkipSummarization")
+	}
+	if got := m.calls.Load(); got != 1 {
+		t.Errorf("model calls = %d, want 1 — SkipSummarization set by a plugin on the tool response must stop the loop, which only holds if the non-partial stop condition is read after the callbacks", got)
 	}
 }
