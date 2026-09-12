@@ -124,21 +124,49 @@ func (f *Flow) Run(ctx agent.InvocationContext) iter.Seq2[*session.Event, error]
 		thoughtOnlyTurns := 0
 		for {
 			var lastEvent *session.Event
+			var lastPartialFinal bool
 			for ev, err := range f.runOneStep(ctx) {
 				if err != nil {
 					yield(nil, err)
 					return
+				}
+				// A partial event crosses the scheduler without the
+				// back-pressure handshake non-partial events get, so once it is
+				// yielded the consumer may be writing Actions.Compaction on it
+				// concurrently — runner.fromPlugin restores the framework's
+				// record over whatever a plugin returned — and this goroutine
+				// must not read the event again. Decide the stop condition for
+				// that case here, where nothing else is touching the event.
+				//
+				// Only that case. A non-partial event is handshaked, so the
+				// consumer's plugin callbacks have finished before the read
+				// below, and they may have changed what IsFinalResponse answers:
+				// fromPlugin restores Compaction only, so a plugin that sets
+				// Actions.SkipSummarization in place keeps it. Deciding early
+				// there would read the pre-callback value and cost an extra
+				// model call, so that read stays exactly where it was.
+				var partialFinal bool
+				if ev.LLMResponse.Partial {
+					partialFinal = ev.IsFinalResponse()
 				}
 				// forward the event first.
 				if !yield(ev, nil) {
 					return
 				}
 				lastEvent = ev
+				lastPartialFinal = partialFinal
 			}
 			if lastEvent == nil {
 				return
 			}
-			if lastEvent.IsFinalResponse() {
+			// LLMResponse.Partial is safe to read after the handoff — the
+			// consumer never writes it, and the branch at the end of this loop
+			// body already does.
+			isFinal := lastPartialFinal
+			if !lastEvent.LLMResponse.Partial {
+				isFinal = lastEvent.IsFinalResponse()
+			}
+			if isFinal {
 				// A thought-only ("thinking") turn reports as final but has no
 				// answer; don't stop on it — call the model again. Give up once
 				// the model has produced only thoughts too many times in a row,
