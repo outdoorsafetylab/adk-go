@@ -18,7 +18,6 @@ import (
 	"context"
 	"fmt"
 	"iter"
-	"os"
 	"strings"
 	"sync/atomic"
 	"testing"
@@ -35,16 +34,6 @@ import (
 
 // numTurns is how many turns each test drives.
 const numTurns = 2
-
-// reproducerEnv gates the truncated-stream reproducer out of the default run.
-//
-// The defect it finds is pre-existing and it only detects it in a minority of
-// runs, so leaving it on would fail unrelated changes for something they did not
-// cause while a green run would still prove nothing. Run it deliberately
-// instead; the measured rates are on TestPluginPathIsRaceFreeOnATruncatedStream.
-// The control case stays on: it is deterministic, and it is what keeps the
-// reproducer's scope honest.
-const reproducerEnv = "ADK_RUN_RACE_REPRODUCER"
 
 // truncatedStreamModel completes a turn with a partial ("streaming") event as
 // its last one: it yields one partial, then its iterator returns normally with
@@ -180,28 +169,25 @@ func runTurns(t *testing.T, appName string, m model.LLM, allowNotFinal bool, plu
 // reads the event and returns nil — the ordinary observing hook, and the branch
 // of fromPlugin that writes back onto the caller's event.
 //
-// This is a reproducer, not a gate: a green run means nothing. The producing
-// goroutine usually returns before it reaches the read — the consumer has
-// already stopped, so `if !yield(ev, nil) { return }` wins — and only the
-// interleaving that gets there records the pair. Measured on darwin/arm64,
-// n=10 each, with the reproducer enabled:
+// Without the base_flow change this commit makes, detection was probabilistic
+// and therefore not a gate: the producing goroutine usually returned before it
+// reached the read (the consumer had already stopped, so
+// `if !yield(ev, nil) { return }` won), and only the interleaving that got there
+// recorded the pair. Measured on darwin/arm64, n=10 each:
 //
-//	-run 'TestPluginPath' -race -count=1        detected 8/10
-//	-race -count=1 -shuffle=on (whole package)  detected 2/10
+//	                                            before  after
+//	-run 'TestPluginPath' -race -count=1         8/10    0/10
+//	-race -count=1 -shuffle=on (whole package)   2/10    0/10
 //
-// The second is the suite's own command, so a passing suite says nothing about
-// whether this is fixed — which is why the reproducer is skipped by default.
-// Instrumenting base_flow to log whether the read on a partial executes
-// confirms the cause rather than leaving it to inference: across 7 green runs
-// it never ran, and in the 1 red run it ran twice. Read the mechanism above
-// rather than trusting a run.
+// With the read hoisted above the handoff there is no unsynchronized access
+// left, so the green is deterministic and this belongs in the default run.
+//
+// Be clear about what it is worth in the other direction, though: the "before"
+// column IS the measurement of moving the read back below the yield, so as a
+// regression detector this is probabilistic, not a gate — 2 runs in 10 under the
+// suite's own command. It documents the invariant and it cannot go red for any
+// other reason; it will not reliably catch someone undoing it.
 func TestPluginPathIsRaceFreeOnATruncatedStream(t *testing.T) {
-	if os.Getenv(reproducerEnv) != "1" {
-		t.Skipf("diagnostic reproducer, not a gate: set %s=1 to run it\n"+
-			"\tADK_RUN_RACE_REPRODUCER=1 go test -race -mod=readonly ./runner -run TestPluginPath -count=1",
-			reproducerEnv)
-	}
-
 	lp, err := loggingplugin.New("logging_plugin")
 	if err != nil {
 		t.Fatalf("loggingplugin.New() error = %v", err)

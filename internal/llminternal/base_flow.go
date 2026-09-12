@@ -124,21 +124,38 @@ func (f *Flow) Run(ctx agent.InvocationContext) iter.Seq2[*session.Event, error]
 		thoughtOnlyTurns := 0
 		for {
 			var lastEvent *session.Event
+			var lastWasFinal bool
 			for ev, err := range f.runOneStep(ctx) {
 				if err != nil {
 					yield(nil, err)
 					return
 				}
+				// Decide this before handing the event off, not after the loop.
+				//
+				// Once an event is yielded, the consumer may write
+				// Actions.Compaction on it — runner.fromPlugin restores the
+				// framework's record over whatever a plugin returned — and a
+				// partial event crosses the scheduler without the back-pressure
+				// handshake that non-partial events get, so this goroutine runs
+				// on while that write happens. Reading Actions.Compaction here
+				// afterwards therefore races it whenever a turn ends on a
+				// partial, which the model.LLM contract permits.
+				//
+				// The value cannot differ for being read earlier: what the
+				// consumer writes back is the record the framework had already
+				// put on the event, captured before any plugin ran.
+				wasFinal := ev.IsFinalResponse()
 				// forward the event first.
 				if !yield(ev, nil) {
 					return
 				}
 				lastEvent = ev
+				lastWasFinal = wasFinal
 			}
 			if lastEvent == nil {
 				return
 			}
-			if lastEvent.IsFinalResponse() {
+			if lastWasFinal {
 				// A thought-only ("thinking") turn reports as final but has no
 				// answer; don't stop on it — call the model again. Give up once
 				// the model has produced only thoughts too many times in a row,
