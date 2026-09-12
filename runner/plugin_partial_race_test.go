@@ -21,13 +21,14 @@ import (
 	"sync/atomic"
 	"testing"
 
+	"google.golang.org/genai"
+
 	"google.golang.org/adk/v2/agent"
 	"google.golang.org/adk/v2/agent/llmagent"
 	"google.golang.org/adk/v2/model"
 	"google.golang.org/adk/v2/plugin"
 	"google.golang.org/adk/v2/plugin/loggingplugin"
 	"google.golang.org/adk/v2/session"
-	"google.golang.org/genai"
 )
 
 // truncatedStreamModel completes a turn with a partial ("streaming") event as
@@ -153,6 +154,19 @@ func runTurns(t *testing.T, appName string, m model.LLM, plugins ...*plugin.Plug
 // The plugin under test is the shipped loggingplugin, whose OnEventCallback
 // reads the event and returns nil — the ordinary observing hook, and the branch
 // of fromPlugin that writes back onto the caller's event.
+//
+// This is a reproducer, not a gate: a green run means nothing. The producing
+// goroutine usually returns before it reaches the read — the consumer has
+// already stopped, so `if !yield(ev, nil) { return }` wins — and only the
+// interleaving where it gets there records the pair. Measured on darwin/arm64:
+//
+//	go test ./runner/ -run 'TestPluginPath' -race -count=1   detects ~3/3
+//	go test ./runner/ -race -count=1 -shuffle=on             detects ~1/10
+//
+// The second is what CI runs, so CI passing says nothing about whether this is
+// fixed. Instrumenting base_flow confirms the cause: across 7 green runs the
+// read on a partial never executed, and in the 1 red run it did. Read the
+// mechanism above rather than trusting a run.
 func TestPluginPathIsRaceFreeOnATruncatedStream(t *testing.T) {
 	lp, err := loggingplugin.New("logging_plugin")
 	if err != nil {
