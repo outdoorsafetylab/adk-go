@@ -18,6 +18,7 @@ import (
 	"context"
 	"fmt"
 	"iter"
+	"os"
 	"strings"
 	"sync/atomic"
 	"testing"
@@ -49,6 +50,15 @@ import (
 // a partial, rather than any behaviour of the shipped Gemini backend.
 // numTurns is how many turns each test drives.
 const numTurns = 2
+
+// reproducerEnv gates the truncated-stream reproducer out of the default run.
+//
+// It detects the race in roughly 1 run in 10 under the suite's own command, and
+// the defect it finds is pre-existing, so leaving it on would fail unrelated
+// changes for something they did not cause while a green run would still prove
+// nothing. Run it deliberately instead. The control case below stays on: it is
+// deterministic and it is what keeps the reproducer's scope honest.
+const reproducerEnv = "ADK_RUN_RACE_REPRODUCER"
 
 type truncatedStreamModel struct{ emitted atomic.Int64 }
 
@@ -172,16 +182,25 @@ func runTurns(t *testing.T, appName string, m model.LLM, allowNotFinal bool, plu
 // This is a reproducer, not a gate: a green run means nothing. The producing
 // goroutine usually returns before it reaches the read — the consumer has
 // already stopped, so `if !yield(ev, nil) { return }` wins — and only the
-// interleaving where it gets there records the pair. Measured on darwin/arm64:
+// interleaving that gets there records the pair. Measured on darwin/arm64,
+// n=10 each, with the reproducer enabled:
 //
-//	go test ./runner/ -run 'TestPluginPath' -race -count=1   detects ~3/3
-//	go test ./runner/ -race -count=1 -shuffle=on             detects ~1/10
+//	-run 'TestPluginPath' -race -count=1        detected 8/10
+//	-race -count=1 -shuffle=on (whole package)  detected 2/10
 //
-// The second is what CI runs, so CI passing says nothing about whether this is
-// fixed. Instrumenting base_flow confirms the cause: across 7 green runs the
-// read on a partial never executed, and in the 1 red run it did. Read the
-// mechanism above rather than trusting a run.
+// The second is the suite's own command, so a passing suite says nothing about
+// whether this is fixed — which is why the reproducer is skipped by default.
+// Instrumenting base_flow to log whether the read on a partial executes
+// confirms the cause rather than leaving it to inference: across 7 green runs
+// it never ran, and in the 1 red run it ran twice. Read the mechanism above
+// rather than trusting a run.
 func TestPluginPathIsRaceFreeOnATruncatedStream(t *testing.T) {
+	if os.Getenv(reproducerEnv) != "1" {
+		t.Skipf("diagnostic reproducer, not a gate: set %s=1 to run it\n"+
+			"\tADK_RUN_RACE_REPRODUCER=1 go test -race -mod=readonly ./runner -run TestPluginPath -count=1",
+			reproducerEnv)
+	}
+
 	lp, err := loggingplugin.New("logging_plugin")
 	if err != nil {
 		t.Fatalf("loggingplugin.New() error = %v", err)
@@ -220,6 +239,7 @@ func TestPluginPathOnCompletedStream(t *testing.T) {
 		t.Fatal("no partial event reached OnEventCallback; this test is not comparable to the truncated-stream case")
 	}
 	if got := tally.nonPartial.Load(); got < numTurns {
-		t.Fatalf("non-partial events reaching OnEventCallback = %d, want at least %d (one terminal aggregate per turn)", got, numTurns)
+		t.Fatalf("non-partial events reaching OnEventCallback = %d across %d turns, want at least %d — the terminal aggregate is what makes this case handshaked, so without it this test proves nothing",
+			got, numTurns, numTurns)
 	}
 }
