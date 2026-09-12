@@ -16,6 +16,7 @@ package runner
 
 import (
 	"context"
+	"fmt"
 	"iter"
 	"strings"
 	"sync/atomic"
@@ -46,6 +47,9 @@ import (
 // TestPluginPathOnCompletedStream, and it does not race. What this test
 // describes is therefore the model.LLM contract, which permits ending a turn on
 // a partial, rather than any behaviour of the shipped Gemini backend.
+// numTurns is how many turns each test drives.
+const numTurns = 2
+
 type truncatedStreamModel struct{ emitted atomic.Int64 }
 
 func (m *truncatedStreamModel) Name() string { return "truncated-stream" }
@@ -80,15 +84,20 @@ func (m *completedStreamModel) GenerateContent(_ context.Context, _ *model.LLMRe
 	}
 }
 
-// partialCounter rides alongside the plugin under test in the SAME run, so what
-// it counts is evidence about that run rather than about a separate one.
-func partialCounter(t *testing.T, partials *atomic.Int64) *plugin.Plugin {
+// eventTally records the shape of what actually reached a plugin callback.
+type eventTally struct{ partial, nonPartial atomic.Int64 }
+
+// eventCounter rides alongside the plugin under test in the SAME run, so what it
+// counts is evidence about that run rather than about a separate one.
+func eventCounter(t *testing.T, tally *eventTally) *plugin.Plugin {
 	t.Helper()
 	p, err := plugin.New(plugin.Config{
-		Name: "partial_counter",
+		Name: "event_counter",
 		OnEventCallback: func(_ agent.InvocationContext, ev *session.Event) (*session.Event, error) {
 			if ev.LLMResponse.Partial {
-				partials.Add(1)
+				tally.partial.Add(1)
+			} else {
+				tally.nonPartial.Add(1)
 			}
 			return nil, nil
 		},
@@ -99,11 +108,17 @@ func partialCounter(t *testing.T, partials *atomic.Int64) *plugin.Plugin {
 	return p
 }
 
-// runTurns drives two turns and fails on any error the runner reports. An
+// runTurns drives numTurns turns and fails on any error the runner reports. An
 // unchecked error would let this file pass for the wrong reason: when
 // OnEventCallback returns an error, run_node.go skips fromPlugin entirely, so
 // the write under test never happens.
-func runTurns(t *testing.T, appName string, m model.LLM, plugins ...*plugin.Plugin) {
+//
+// allowNotFinal belongs to the truncated-stream case alone. A turn whose last
+// event is a partial trips base_flow's "last event is not final" check on v2.2.0
+// and v2.3.0 (the check is gone by v2.4.0). A completed stream must never need
+// that exemption, so granting it there would hide an aggregate that went
+// missing — which is the whole thing the control case exists to rule out.
+func runTurns(t *testing.T, appName string, m model.LLM, allowNotFinal bool, plugins ...*plugin.Plugin) {
 	t.Helper()
 	root, err := llmagent.New(llmagent.Config{Name: "assistant", Model: m})
 	if err != nil {
@@ -119,17 +134,16 @@ func runTurns(t *testing.T, appName string, m model.LLM, plugins ...*plugin.Plug
 	if err != nil {
 		t.Fatalf("New() error = %v", err)
 	}
-	for _, q := range []string{"q1", "q2"} {
+	for i := range numTurns {
+		q := fmt.Sprintf("q%d", i+1)
 		for _, runErr := range r.Run(t.Context(), "u", "s", genai.NewContentFromText(q, genai.RoleUser), agent.RunConfig{}) {
-			// One error is expected and orthogonal: a turn whose last event is a
-			// partial trips base_flow's "last event is not final" check on v2.2.0
-			// and v2.3.0 (the check is gone by v2.4.0). Everything else fails the
-			// test, because an unchecked error would let this file pass for the
-			// wrong reason — when OnEventCallback returns an error, run_node.go
-			// skips fromPlugin and the write under test never happens.
-			if runErr != nil && !strings.Contains(runErr.Error(), "last event is not final") {
-				t.Fatalf("Run() error = %v", runErr)
+			if runErr == nil {
+				continue
 			}
+			if allowNotFinal && strings.Contains(runErr.Error(), "last event is not final") {
+				continue
+			}
+			t.Fatalf("Run() error = %v", runErr)
 		}
 	}
 }
@@ -172,14 +186,14 @@ func TestPluginPathIsRaceFreeOnATruncatedStream(t *testing.T) {
 	if err != nil {
 		t.Fatalf("loggingplugin.New() error = %v", err)
 	}
-	var partials atomic.Int64
+	var tally eventTally
 	m := &truncatedStreamModel{}
-	runTurns(t, "truncated_stream", m, lp, partialCounter(t, &partials))
+	runTurns(t, "truncated_stream", m, true, lp, eventCounter(t, &tally))
 
 	if got := m.emitted.Load(); got == 0 {
 		t.Fatalf("model emitted %d responses; the run did not happen", got)
 	}
-	if partials.Load() == 0 {
+	if tally.partial.Load() == 0 {
 		t.Fatal("no partial event reached OnEventCallback in this run; this test no longer exercises the unhandshaked path")
 	}
 }
@@ -194,11 +208,18 @@ func TestPluginPathOnCompletedStream(t *testing.T) {
 	if err != nil {
 		t.Fatalf("loggingplugin.New() error = %v", err)
 	}
-	var partials atomic.Int64
+	var tally eventTally
 	m := &completedStreamModel{}
-	runTurns(t, "completed_stream", m, lp, partialCounter(t, &partials))
+	runTurns(t, "completed_stream", m, false, lp, eventCounter(t, &tally))
 
-	if partials.Load() == 0 {
+	// Both halves are load-bearing. Without the partial this is not comparable to
+	// the truncated-stream case; without the terminal aggregate there is nothing
+	// handshaked to explain why it does not race, and an aggregate that went
+	// missing would leave this passing for the wrong reason.
+	if tally.partial.Load() == 0 {
 		t.Fatal("no partial event reached OnEventCallback; this test is not comparable to the truncated-stream case")
+	}
+	if got := tally.nonPartial.Load(); got < numTurns {
+		t.Fatalf("non-partial events reaching OnEventCallback = %d, want at least %d (one terminal aggregate per turn)", got, numTurns)
 	}
 }
