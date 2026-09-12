@@ -33,6 +33,19 @@ import (
 	"google.golang.org/adk/v2/session"
 )
 
+// numTurns is how many turns each test drives.
+const numTurns = 2
+
+// reproducerEnv gates the truncated-stream reproducer out of the default run.
+//
+// The defect it finds is pre-existing and it only detects it in a minority of
+// runs, so leaving it on would fail unrelated changes for something they did not
+// cause while a green run would still prove nothing. Run it deliberately
+// instead; the measured rates are on TestPluginPathIsRaceFreeOnATruncatedStream.
+// The control case stays on: it is deterministic, and it is what keeps the
+// reproducer's scope honest.
+const reproducerEnv = "ADK_RUN_RACE_REPRODUCER"
+
 // truncatedStreamModel completes a turn with a partial ("streaming") event as
 // its last one: it yields one partial, then its iterator returns normally with
 // no error and no terminal aggregate.
@@ -48,18 +61,6 @@ import (
 // TestPluginPathOnCompletedStream, and it does not race. What this test
 // describes is therefore the model.LLM contract, which permits ending a turn on
 // a partial, rather than any behaviour of the shipped Gemini backend.
-// numTurns is how many turns each test drives.
-const numTurns = 2
-
-// reproducerEnv gates the truncated-stream reproducer out of the default run.
-//
-// It detects the race in roughly 1 run in 10 under the suite's own command, and
-// the defect it finds is pre-existing, so leaving it on would fail unrelated
-// changes for something they did not cause while a green run would still prove
-// nothing. Run it deliberately instead. The control case below stays on: it is
-// deterministic and it is what keeps the reproducer's scope honest.
-const reproducerEnv = "ADK_RUN_RACE_REPRODUCER"
-
 type truncatedStreamModel struct{ emitted atomic.Int64 }
 
 func (m *truncatedStreamModel) Name() string { return "truncated-stream" }
